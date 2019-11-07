@@ -1,0 +1,156 @@
+sub GettingOSMdata/*(vSourceFolder, vResultFolder)*/
+
+/*------------------------------------------------------------- extract GeoJson data from files-----------------------------------------------*/
+
+[OSMData_raw2]:
+//Заполняем значения поля ID вниз до след. значения ID
+LOAD
+Trim([@1]) as [Plain text],
+IF(IsNull( If(Index(@1,'"id"'),@1) )
+,peek([id])
+,If(Index(@1,'"id"'),@1)
+) AS [id]
+FROM [lib://OSM/data/*.GeoJson]
+(txt, utf8, explicit labels, delimiter is ';', msq)
+where not Match(trim(@1),'}','{','},','} ]','},{','"features" : [{','"properties" : {','"type":"Feature",','"alltags" : {','"timestamp"') //фильтруем мусор
+;
+
+
+NoConcatenate
+[OSMData_raw1]:
+//Финальная чистка
+LOAD Distinct
+PurgeChar([Key],'" ') as [Key],
+Replace(Replace([Value],'",',''),'"}','') as [Value],
+id
+;
+//Преобразование для координат
+LOAD
+id_num as id,
+if(WildMatch([Key],'"geometry"*'),'coordinate',[Key]) as [Key],
+if(WildMatch([Key],'"geometry"*'),Mid(PurgeChar(Key,'"geometry": {"type":"MultiPolygon""coordinates":}'),2),[Value]) as [Value]
+;
+//Разобъем значения на Key и Value (не сработает для координат и поля bbox, координаты обработаю выше, а поле bbox отфильтрую на след. этапе)
+LOAD
+[Plain text] as [Plain text],
+SubField([Plain text],': "',1) as [Key],
+SubField([Plain text],': "',2) as [Value],
+[id],
+PurgeChar([id],' ",id:') as id_num //отчистим поле id
+Resident [OSMData_raw2];
+
+drop Table OSMData_raw2;
+
+
+/*------------------------------------------------------------- Tranform and clean data-----------------------------------------------*/
+
+[OSMData_temp2]:
+Load
+id as [Key],
+Key as [Attribute],
+Value
+Resident [OSMData_raw1]
+where not IsNull(id)
+and not WildMatch(Key,'note','srid','official_name','name','name:*','boundary','*alt_*','*official_name*','ref:*','timezone','gost_7.67-2003','*_name*','*bbox*') //предварительный фильтр по полям
+;
+
+drop Table [OSMData_raw1];
+
+OSMData:
+Load distinct Key Resident OSMData_temp2;
+
+LET vTotalRows = NoOfRows('OSMData'); //Для последующей фильтрации полей по заполняемости значениями
+
+//Преобразование к плоской табилце
+GenericLabel:
+Generic
+Load
+[Key],
+[Attribute],
+trim(Value) as Value
+Resident OSMData_temp2;
+
+drop Table OSMData_temp2;
+
+Set vListOfTables = ;
+
+For vTableNo = 0 to NoOfTables()
+
+Let vTableName = TableName($(vTableNo)) ;
+
+If Subfield(vTableName,'.',1)='GenericLabel' Then
+
+Let vListOfTables = vListOfTables & If(Len(vListOfTables)>0,',') & Chr(39) & vTableName & Chr(39) ;
+
+End If
+
+Next vTableNo
+
+
+For each vTableName in $(vListOfTables)
+
+if alt(NoOfRows('$(vTableName)'),1)/$(vTotalRows) > 0.5 then //Фильтр по кол-ву значений в поле, чтобы не тащить слабозаполенный мусор, если заполняемость поля более 40% добавляем данные
+
+Left Join (OSMData)
+Load
+*
+Resident [$(vTableName)]
+;
+
+ELSE
+TRACE ' ';
+ENDIF
+
+Drop Table [$(vTableName)];
+
+Next vTableName
+
+
+Store [OSMData] into [lib://OSM/Result/Границы административно-территориального деления.qvd]  (qvd); 
+
+
+/*----------------------------------------------- Building hierarchies-----------------------------------------------*/
+
+//Отдельно сделаем файл с иерархической структурой
+[OSMData_hierarchies_1]:
+Hierarchy(Key, ParentKey, Name, ParentName, Name, PathName, '\', Depth)
+LOAD
+Key,
+Subfield( Mid(rpath,Index(rpath,Key)+Len(Key)+1,100) ,',',1) as [ParentKey],
+Name,
+rpath
+;
+LOAD
+Key,
+localname as Name,
+Replace(rpath,',0','') as rpath
+Resident [OSMData]
+where not IsNull(rpath)
+;
+
+NoConcatenate
+[OSMData_hierarchies]:
+LOAD
+*
+Resident [OSMData_hierarchies_1]
+//блок для фильтрации корявых данных из OSM.
+//Например в случае загрузки данных по всей РФ фильтрую Крым и Севастополь т.к. разные области принадлежат то России то Украине
+/*where
+(Match(Name2,'Дальневосточный федеральный округ','Приволжский федеральный округ','Северо-Западный федеральный округ','Северо-Кавказский федеральный округ','Сибирский федеральный округ','Уральский федеральный округ','Центральный федеральный округ',) or IsNull(Name2) )
+OR
+(Name2='Южный федеральный округ' and Match(Name3,'Астраханская область','Волгоградская область','Краснодарский край','Республика Адыгея','Республика Калмыкия','Ростовская область') or IsNull(Name3) )
+*/
+;
+
+DROP FIELD rpath from [OSMData_hierarchies];
+drop Tables [OSMData_hierarchies_1];
+
+STORE [OSMData_hierarchies] into [lib://OSM/Result/Иерархия административно-территориального деления.qvd] (qvd);
+
+LET vTotalRows=;
+LET vTableName=;
+LET vListOfTables=;
+LET vSourceFolder=;
+LET vQVDFolder=;
+
+end sub;
